@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Folder Image Viewer</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      text-align: center;
+    }
+
+    #drop-zone {
+      border: 2px dashed #888;
+      padding: 5%;
+      margin: 5% auto;
+      width: 80%;
+      max-width: 800px;
+    }
+
+    input[type="range"] {
+      width: 80%;
+      margin: 10px auto;
+      display: block;
+    }
+
+    .viewer-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+
+      width: 80%;
+      max-width: 800px;
+      margin: 0 auto;
+    }
+
+    .viewer-container input[type="range"] {
+      width: 100%;
+      margin: 10px 0;
+    }
+
+    .viewer-container img {
+      width: 100%;
+      height: auto;
+    }
+
+    .controls {
+      margin-top: 10px;
+      display: flex;
+      gap: 20px;
+    }
+
+    button {
+      padding: 10px 20px;
+    }
+
+    #variable-row {
+      margin: 15px auto;
+      width: 80%;
+      max-width: 800px;
+      text-align: left;
+      display: none;
+    }
+
+    #variable-row label {
+      font-weight: bold;
+      margin-right: 8px;
+    }
+
+    #variableSelect {
+      padding: 6px 10px;
+      font-size: 0.95em;
+    }
+
+    #noDataMessage {
+      color: #b00020;
+      font-weight: bold;
+      padding: 10px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <h2>Folder Image Viewer</h2>
+  <div id="drop-zone">Drag &amp; drop a folder here</div>
+
+  <div id="variable-row">
+    <label for="variableSelect">変数 (Variable)</label>
+    <select id="variableSelect"></select>
+  </div>
+
+  <div class="viewer-container">
+
+    <p>Slice position (slice Number)</p>
+    <input type="range" id="sliceSlider" min="0" max="0" value="0">
+
+    <p>Time (s Number)</p>
+    <input type="range" id="timeSlider" min="0" max="0" value="0">
+
+    <img id="viewer" />
+    <div id="noDataMessage">この組み合わせのデータはありません (No data for this combination)</div>
+
+    <div class="controls">
+      <button id="play">▶ Play</button>
+      <button id="stop">⏹ Stop</button>
+    </div>
+
+  </div>
+
+</body>
+</html>
+
+<script>
+  const dropZone = document.getElementById("drop-zone");
+  const viewer = document.getElementById("viewer");
+  const noDataMessage = document.getElementById("noDataMessage");
+  const sliceSlider = document.getElementById("sliceSlider");
+  const timeSlider = document.getElementById("timeSlider");
+  const variableRow = document.getElementById("variable-row");
+  const variableSelect = document.getElementById("variableSelect");
+
+  // structuredImages[variable][slice][s] = url
+  let structuredImages = {};
+  let variableKeys = [];
+  let sliceKeys = [];
+  let sKeys = [];
+  let playInterval = null;
+
+  // ----------- Drag & Dropの処理 -----------
+  dropZone.addEventListener("dragover", e => {
+    e.preventDefault();
+    dropZone.style.background = "#eef";
+  });
+
+  dropZone.addEventListener("dragleave", () => {
+    dropZone.style.background = "";
+  });
+
+  dropZone.addEventListener("drop", e => {
+    e.preventDefault();
+    dropZone.style.background = "";
+    structuredImages = {};
+    readItems(e.dataTransfer.items);
+  });
+
+  function readItems(items) {
+    for (const item of items) {
+      const entry = item.webkitGetAsEntry();
+      if (entry && entry.isDirectory) {
+        readAllDirectory(entry);
+      }
+    }
+  }
+
+  // ----------- (100件制限を回避) -----------
+  function readAllDirectory(dirEntry) {
+    const reader = dirEntry.createReader();
+    let entries = [];
+
+    function readBatch() {
+      reader.readEntries(batch => {
+        if (batch.length === 0) {
+          //全エントリ読み込み完了
+          processEntries(entries);
+          return;
+        }
+        entries = entries.concat(batch);
+        readBatch();
+      });
+    }
+    readBatch();
+  }
+
+  function processEntries(entries) {
+    // 拡張子チェック
+    const imageEntries = entries.filter(
+      entry => entry.isFile && /\.(svg)$/i.test(entry.name)
+    );
+
+    //残り件数カウント
+    let remaining = imageEntries.length;
+
+    if (remaining === 0) {
+      //画像がゼロ枚のとき
+      finalizeLoad();
+      return;
+    }
+
+    imageEntries.forEach(entry => {
+      entry.file(file => {
+        const parsed = parseFilename(entry.name);
+
+        if (parsed) {
+          //命名規則に合うファイルのみURLを作成
+          const url = URL.createObjectURL(file);
+          const { slice, variable, s } = parsed;
+
+          if (!structuredImages[variable]) structuredImages[variable] = {};
+          if (!structuredImages[variable][slice]) structuredImages[variable][slice] = {};
+          structuredImages[variable][slice][s] = url;
+        }
+
+        remaining--;
+        if (remaining === 0) {
+          // 全件読み込み完了後に1回だけ集計
+          finalizeLoad();
+        }
+      });
+    });
+  }
+
+  // 全ファイルの読み込み・格納が終わった後に1回だけ呼ばれる、集計・画面更新のまとめ役
+  function finalizeLoad() {
+    rebuildIndexKeys();
+    updateVariableSelector();
+    setupSliders();
+    updateImage();
+  }
+
+  // ----------- Filename -----------
+  // 例 : y_slice_1_delta_density_s=0001000_t=3.503E-03
+  // match[1]: sliceの後の数字, match[2]: 変数名(スライス番号とs=の間の文字列), match[3]: s=の後の数字
+
+  function parseFilename(name) {
+    const match = name.match(/_slice_(\d+)_(.+?)_s=(\d+)/);
+    if (!match) return null;
+    return {
+      slice: match[1],
+      variable: match[2],
+      s: match[3]
+    };
+  }
+
+  // ----------- Index Keys (variable / slice / time) -----------
+  function rebuildIndexKeys() {
+    variableKeys = Object.keys(structuredImages).sort();
+  }
+
+  function currentVariable() {
+    return variableSelect.value || variableKeys[0];
+  }
+
+  // ----------- Variable Pulldown -----------
+  function updateVariableSelector() {
+    const previousValue = variableSelect.value;
+
+    // 変数のプルダウンの作り直し防止
+    const existing = Array.from(variableSelect.options).map(o => o.value);
+    const sameSet = existing.length === variableKeys.length &&
+      existing.every((v, i) => v === variableKeys[i]);
+    if (sameSet) return;
+
+    variableSelect.innerHTML = "";
+    variableKeys.forEach(v => {
+      const opt = document.createElement("option");
+      opt.value = v;
+      opt.textContent = v;
+      variableSelect.appendChild(opt);
+    });
+
+    // 前に選んでいた変数がまだ存在するなら、それを維持
+    if (variableKeys.includes(previousValue)) {
+      variableSelect.value = previousValue;
+    }
+
+    variableRow.style.display = variableKeys.length > 0 ? "block" : "none";
+  }
+
+  variableSelect.addEventListener("change", () => {
+    setupSliders();
+    updateImage();
+  });
+
+  function updateSliceAndTimeKeys() {
+    const variable = currentVariable();
+    const data = structuredImages[variable] || {};
+
+    sliceKeys = Object.keys(data).sort((a, b) => Number(a) - Number(b));
+
+    // スライスごとにステップ数が異なる可能性があるから全スライスの s の和集合を時間軸の基準にする。
+    const sSet = new Set();
+    sliceKeys.forEach(slice => {
+      Object.keys(data[slice]).forEach(s => sSet.add(s));
+    });
+    sKeys = Array.from(sSet).sort((a, b) => Number(a) - Number(b));
+  }
+
+  // ----------- Slider Update -----------
+  function setupSliders() {
+    updateSliceAndTimeKeys();
+    sliceSlider.max = Math.max(sliceKeys.length - 1, 0);
+    timeSlider.max = Math.max(sKeys.length - 1, 0);
+  }
+
+  // ----------- Image Update -----------
+  function updateImage() {
+    if (sliceKeys.length === 0 || sKeys.length === 0) {
+      viewer.src = "";
+      noDataMessage.style.display = "none";
+      return;
+    }
+
+    const variable = currentVariable();
+    const slice = sliceKeys[sliceSlider.value];
+    const s = sKeys[timeSlider.value];
+
+    const url = structuredImages[variable] &&
+      structuredImages[variable][slice] &&
+      structuredImages[variable][slice][s];
+
+    if (url) {
+      viewer.src = url;
+      viewer.style.display = "block";
+      noDataMessage.style.display = "none";
+    } else {
+      // データが欠けているとき直前のフレームを残さずに「データなし」と表示
+      viewer.style.display = "none";
+      noDataMessage.style.display = "block";
+    }
+  }
+
+  sliceSlider.addEventListener("input", updateImage);
+  timeSlider.addEventListener("input", updateImage);
+
+  // ----------- Slideshow -----------
+  document.getElementById("play").addEventListener("click", () => {
+    if (playInterval) return;
+
+    playInterval = setInterval(() => {
+      let t = Number(timeSlider.value) + 1;
+      if (t > timeSlider.max) t = 0;
+      timeSlider.value = t;
+      updateImage();
+    }, 50);
+  });
+
+  document.getElementById("stop").addEventListener("click", () => {
+    clearInterval(playInterval);
+    playInterval = null;
+  });
+</script>
